@@ -213,8 +213,8 @@ def print_help():
 def setup_db_connection(pServer, pDB, pUser, pPw):
     global connection
     connection = pymysql.connect(host=pServer,
-                                 user=pPw,
-                                 password=pUser,
+                                 user=pUser,
+                                 password=pPw,
                                  db=pDB,
                                  charset='utf8mb4',
                                  cursorclass=pymysql.cursors.DictCursor)
