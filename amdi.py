@@ -1,79 +1,100 @@
 import nbt
 import pymysql
-import time
 from uuid import UUID
 from nbt2json import *
+import hashlib
+import sys
+import getopt
 
-# Define the path of your minecraft server world here
-# This folder must contain the "playerdata", "data" and "region" folders!
-minecraft_base_dir = "E:/Projekte/Python/MCStatDumper/DreamCraft/"
+connection = ''
+g_minecraft_basedir = ''
 
-# Set your sql connection info here
-connection = pymysql.connect(host='localhost',
-                             user='root',
-                             password='root',
-                             db='mcdatadump',
-                             charset='utf8mb4',
-                             cursorclass=pymysql.cursors.DictCursor)
 
-# ========================================================
-# End of config
-# ========================================================
-
-def get_or_create_playerid(pPlayerUUID, pPlayerName):
+def get_or_create_playerid(p_player_uuid, p_player_name):
     with connection.cursor() as cur:
         sql = "SELECT * FROM mcuserprofiles WHERE UUID = %s"
-        row_count = cur.execute(sql, (pPlayerUUID, ))
+        row_count = cur.execute(sql, (p_player_uuid, ))
         if row_count > 0:
             res = cur.fetchone()
-            tPlayerID = res["ID"]
+            t_player_id = res["ID"]
             if res["LastName"] == "__TMP_NOTSET":
-                if pPlayerName:
-                    cur.execute("UPDATE mcuserprofiles SET LastName = %s WHERE ID = %s", (pPlayerName, tPlayerID))
+                if p_player_name:
+                    cur.execute("UPDATE mcuserprofiles SET LastName = %s WHERE ID = %s", (p_player_name, tPlayerID))
                     connection.commit()
 
-            return tPlayerID
+            return t_player_id
         else:
-            tPlayerName = pPlayerName
-            if not pPlayerName:
+            tPlayerName = p_player_name
+            if not p_player_name:
                 tPlayerName = "__TMP_NOTSET"
 
-            cur.execute("INSERT INTO mcuserprofiles (UUID, LastName) VALUE (%s, %s)", (pPlayerUUID, tPlayerName))
+            cur.execute("INSERT INTO mcuserprofiles (UUID, LastName) VALUE (%s, %s)", (p_player_uuid, tPlayerName))
             connection.commit()
             return cur.lastrowid
 
-def validate_uuid( pUUID ):
+
+def validate_uuid(p_uuid):
     try:
-        val = UUID(pUUID, version=4)
+        val = UUID(p_uuid, version=4)
     except ValueError:
         return False
     
-    return val.hex == pUUID
+    return val.hex == p_uuid
 
 # ============================================================================
 
+
 # Dump all .json stat-files into our DB
 def dump_stats_to_sql():
-    tSQLInsert = "INSERT INTO mcstats (playerID, statsJson) VALUES (%s, %s)"
-    indir = minecraft_base_dir + '/stats/'
-    tCounter = 0
-    for root, dirs, filenames in os.walk(indir):
-        for f in filenames:
-            if f.endswith(".json"):
-                json_data = open( indir + f ).read()
-                tUUID = f[:-5]
-                tPlayerID = get_or_create_playerid(tUUID, "")
-                connection.cursor().execute(tSQLInsert, (tPlayerID, json_data))
-                connection.commit()
-                tCounter += 1
+    sql_stats_insert = "INSERT INTO mcstats (playerID, statsJson) VALUES (%s, %s)"
+    sql_stats_update = "UPDATE mcstats SET statsJson = %s, crc = %s WHERE ID = %s"
+    sql_stats_query = "SELECT ID, crc from mcstats WHERE playerID = %s"
 
-    print("Imported " + str(tCounter) + " Stats")
+    indir = g_minecraft_base_dir + '/stats/'
+    t_counter_new = 0
+    t_counter_update = 0
+    with connection.cursor() as cur:
+        for root, dirs, filenames in os.walk(indir):
+            for f in filenames:
+                if f.endswith(".json"):
+                    json_data = open( indir + f ).read()
+                    # Replace all dots
+                    json_data = json_data.replace(".", "")
+                    json_hash = hashlib.sha256(json_data).hexdigest()
+                    tUUID = f[:-5]
+                    tPlayerID = get_or_create_playerid(tUUID, "")
+                    row_count = cur.execute(sql_stats_query, (tPlayerID,))
+                    if row_count > 0:
+                        print ("Existing stat-row found, checking CRC")
+                        res = cur.fetchone()
+                        tCRC = res["crc"]
+                        tID = res["ID"]
+                        if tCRC != json_hash:
+                            print ("CRC mismatch; Stat file has changed. Updating")
+                            connection.cursor().execute(sql_stats_update, (json_data, json_hash, tID))
+                            t_counter_update += 1
+                        else:
+                            print ("CRC match; Nothing to do")
+                            continue
+                    else:
+                        print ("No existing stat-row found. Creating new")
+                        connection.cursor().execute(sql_stats_insert, (tPlayerID, json_data))
+                        connection.commit()
+                        t_counter_new += 1
+
+    print("Imported " + str(t_counter_new) + " new Stats and updated " + str(t_counter_update) + " existing ones")
+
 
 # Dump all player-profiles into our DB
 def dump_playerprofile_to_sql():
-    tCounter = 0
+    sql_profile_insert = "INSERT INTO mcprofiles (playerID, PlayerDat) VALUES (%s, %s)"
+    sql_profile_update = "UPDATE mcprofiles SET PlayerDat = %s, crc = %s WHERE ID = %s"
+    sql_profile_query = "SELECT ID, crc from mcprofiles WHERE playerID = %s"
+    t_counter_new = 0
+    t_counter_update = 0
+
     with connection.cursor() as cur:
-        indir = minecraft_base_dir + '/playerdata/'
+        indir = g_minecraft_base_dir + '/playerdata/'
         for root, dirs, filenames in os.walk(indir):
             for f in filenames:
                 tFullPath = indir + f
@@ -83,21 +104,46 @@ def dump_playerprofile_to_sql():
                     tNBTFile = nbt.nbt.NBTFile(tFullPath)
                     tLastKnownName = str(tNBTFile["bukkit"]["lastKnownName"])
                     tPlayerID = get_or_create_playerid(tUserUUID, tLastKnownName)
-                    cur.execute("INSERT INTO mcprofiles (playerID, PlayerDat) VALUES (%s, %s)", (tPlayerID, convert2json(tFullPath)))
-                    tCounter += 1
+                    json_data = convert2json(tFullPath)
+                    json_hash = hashlib.sha256(json_data).hexdigest()
 
-    connection.commit()
-    print("Imported " + str(tCounter) + " Player-Profiles")
+                    row_count = cur.execute(sql_profile_query, (tPlayerID,))
+                    if row_count > 0:
+                        print ("Existing playerdat-row found, checking CRC")
+                        res = cur.fetchone()
+                        tCRC = res["crc"]
+                        tID = res["ID"]
+                        if tCRC != json_hash:
+                            print ("CRC mismatch; playerdat file has changed. Updating")
+                            connection.cursor().execute(sql_profile_update, (json_data, json_hash, tID))
+                            connection.commit()
+                            t_counter_update += 1
+                        else:
+                            print ("CRC match; Nothing to do")
+                            continue
+                    else:
+                        print ("No existing playerdat-row found. Creating new")
+                        connection.cursor().execute(sql_profile_insert, (tPlayerID, json_data))
+                        connection.commit()
+                        t_counter_new += 1
+
+                    cur.execute(sql_profile_insert, (tPlayerID, json_data))
+                    t_counter_new += 1
+
+    print("Imported " + str(t_counter_new) + " new player profiles and updated " + str(t_counter_update) + " existing ones")
+
 
 # Parse all -grave- files in given dim-directory and dump the info into our DB
 def dump_gravedim_to_sql(pDimension):
     tCounter = 0
+    sql_grave_query = "SELECT count(ID) from graves WHERE graveFullPath = %s"
     tSQLInsert = "INSERT INTO graves (playerID, graveDim, graveFullPath, gravedata) VALUES (%s, (SELECT ID FROM dimensionref WHERE DimName = %s), %s, %s)"
+
     indir = ""
     if not pDimension:
-        indir = minecraft_base_dir + '/data/'
+        indir = g_minecraft_base_dir + '/data/'
     else:
-        indir = minecraft_base_dir + pDimension + '/data/'
+        indir = g_minecraft_base_dir + pDimension + '/data/'
 
     with connection.cursor() as cur:
         for root, dirs, filenames in os.walk(indir):
@@ -109,15 +155,21 @@ def dump_gravedim_to_sql(pDimension):
                     tPlayerName = str(tNBTFile["PlayerName"])
 
                     tPlayerSQLID = get_or_create_playerid(tPlayerUUID, tPlayerName)
-                    cur.execute(tSQLInsert, (tPlayerSQLID,
-                                             pDimension,
-                                             tFullPath,
-                                             convert2json(tFullPath)))
+
+                    row_count = cur.execute(sql_grave_query, (tFullPath,))
+                    if row_count > 0:
+                        print("Grave file " + tFullPath + " is already known. Skipping")
+                    else:
+                        cur.execute(tSQLInsert, (tPlayerSQLID,
+                                                 pDimension,
+                                                 tFullPath,
+                                                 convert2json(tFullPath)))
                     tCounter += 1
 
     connection.commit()
 
     print("Imported " + str(tCounter) + " Graves")
+
 
 # Get the dim-info from SQL that shall be processed and trigger read functions
 def iterate_defined_dimensions():
@@ -133,6 +185,7 @@ def iterate_defined_dimensions():
                 print("Processing DIM > " + dimName + " <")
                 dump_gravedim_to_sql(dimName)
 
+
 def clean_tables():
     with connection.cursor() as cur:
         cur.execute("TRUNCATE TABLE mcstats")
@@ -143,39 +196,102 @@ def clean_tables():
         connection.commit()
 
 
-start_time = time.time()
-print("==== ================================================================= ====")
-print("====       Welcome to A.M.D.I. (Awesome Minecraft Data Importer)       ====")
-print("==== ================================================================= ====")
-print("  == This script will now import all your stats, profiles and graves   ==")
-print("  == into your MySQL Database for later usage. We will truncate any    ==")
-print("  == old data before we start, so you won't get old remains in your DB ==")
-print("  == Global UUIDs and Names are stored forever, for easier lookup      ==")
-print("  == ================================================================= ==")
-raw_input("Press any key to start!")
-print("== Ok, let's do this. (This may take a while, you can grab a coffee)")
-print("== Cleaning Tables...")
-single_start_time = time.time()
-clean_tables()
-print("== ... done. Took %s seconds" % (time.time() - single_start_time))
+def print_help():
+    print 'amdi.py [-h/-s/-f/] [-i/-ipath] <inputfile> -c <db-server> -d <db-name> -u <db-user> -p <db-password>'
+    print 'Args: '
+    print ' -h : Show help'
+    print ' -s : Run in Sync-Mode. Will resync DB to folder'
+    print ' -f : Run in Full-Mode. Will erase DB Data and import from scratch'
+    print ' -i : Specify input-folder. This folder MUST CONTAIN playerdata, data and region subfolders!'
+    print '      It must also end with a slash; Ex: /opt/minecraft/server/worldname/'
+    print ' -c : IP/Hostname of the MySQL Server'
+    print ' -d : Database-Name'
+    print ' -u : Username for the MySQL connection'
+    print ' -p : Password for the MySQL connection'
 
-print("Importing Player-Profiles...")
-single_start_time = time.time()
-dump_playerprofile_to_sql()
-print("== ... done. Took %s seconds" % (time.time() - single_start_time))
 
-print("Importing Player-Stats...")
-single_start_time = time.time()
-dump_stats_to_sql()
-print("== ... done. Took %s seconds" % (time.time() - single_start_time))
+def setup_db_connection(pServer, pDB, pUser, pPw):
+    global connection
+    connection = pymysql.connect(host=pServer,
+                                 user=pPw,
+                                 password=pUser,
+                                 db=pDB,
+                                 charset='utf8mb4',
+                                 cursorclass=pymysql.cursors.DictCursor)
 
-print("Importing Player-Graves...")
-single_start_time = time.time()
-iterate_defined_dimensions()
-print("== ... done. Took %s seconds" % (time.time() - single_start_time))
 
-print("=====================================================================")
-print(" DataImport complete")
-print(" Total execution time: %s" % (time.time() - start_time))
-print("=====================================================================")
+def run_sync_mode():
+    dump_playerprofile_to_sql()
+    dump_stats_to_sql()
+    iterate_defined_dimensions()
 
+
+def run_full_mode():
+    clean_tables()
+    run_sync_mode()
+
+
+def main(argv):
+    global g_minecraft_base_dir
+    db_server = ''
+    db_name = ''
+    db_user = ''
+    db_pw = ''
+
+    runmode = 0
+    totalArgsSet = 0
+
+    try:
+        opts, args = getopt.getopt(argv,"hsfi:c:u:p:d:")
+    except getopt.GetoptError:
+        print_help()
+        sys.exit()
+
+    for opt, arg in opts:
+        if opt == '-h':
+            print_help()
+            sys.exit()
+        elif opt == "-i":
+            g_minecraft_base_dir = arg
+            totalArgsSet += 1
+        elif opt == "-c":
+            db_server = arg
+            totalArgsSet += 1
+        elif opt == "-d":
+            db_name = arg
+            totalArgsSet += 1
+        elif opt == "-u":
+            db_user = arg
+            totalArgsSet += 1
+        elif opt == "-p":
+            db_pw = arg
+            totalArgsSet += 1
+        elif opt == "-s":
+            if runmode != 0:
+                print("ERROR: You can not specify -s and -f together!")
+                sys.exit(2)
+            else:
+                runmode = 1
+        elif opt in ("-f"):
+            if runmode != 0:
+                print("ERROR: You can not specify -s and -f together!")
+                sys.exit(2)
+            else:
+                runmode = 2
+
+    if totalArgsSet != 5 or runmode == 0:
+        print_help()
+        sys.exit(2)
+    else:
+        setup_db_connection(db_server,db_name,db_user,db_pw)
+        if runmode == 1:
+            run_sync_mode()
+        elif runmode == 2:
+            run_full_mode()
+        else:
+            print("Invalid Runmode")
+            sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
